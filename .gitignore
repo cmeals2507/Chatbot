@@ -1,0 +1,8 @@
+# RAG caches (do not commit)
+.cache/
+.grounding_cache.json
+.upload_cache.json
+
+# Optional large index artifacts
+*.npz
+*.faiss
