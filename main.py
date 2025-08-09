@@ -1,5 +1,5 @@
 """
-Streamlit-powered Chatbot with optional document grounding.
+Ensemble Pedagogy Chatbot — Streamlit app with optional document grounding.
 
 This application provides a simple conversational interface backed by
 OpenAI's Chat Completion API.  It exposes the ``gpt‑4.1‑mini`` model with a
@@ -15,6 +15,16 @@ variable.  You will also need to install the dependencies listed in
 ``requirements.txt`` within a virtual environment.  See the README or
 deployment notes for further details.
 """
+
+# --- Conversation window settings ---
+RECENT_TURNS = 6  # number of most-recent chat turns to send to the model per request
+
+def recent_history(messages, n: int = RECENT_TURNS):
+    """
+    Return only the last `n` user/assistant turns (order preserved).
+    Each "turn" here is a single message dict in st.session_state["messages"].
+    """
+    return list(messages[-n:])
 
 
 FIXED_TEMP_PREFIXES = ("o1", "o3", "o4")
@@ -49,6 +59,9 @@ def token_truncate(text: str, max_tokens: int, model: str = "gpt-4.1-mini") -> s
     tokens = enc.encode(text)
     truncated = tokens[:max_tokens]
     return enc.decode(truncated)
+
+
+
 
 
 def file_hash(path: str) -> str:
@@ -321,10 +334,10 @@ def load_grounding_files(progress_callback=None) -> None:
             summary = summarise_document(text_for_summary, model=st.session_state.get("model", "o4-mini"))
         else:
             summary = ""
-        # Truncate for embedding (safe chunk: 500 tokens per chunk)
+        # Truncate for embedding (tighter chunks: 350 tokens, chunk_size 1600)
         chunks = []
-        for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=2000, overlap=200):
-            chunk_txt = token_truncate(raw_chunk, 500)
+        for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=1600, overlap=200):
+            chunk_txt = token_truncate(raw_chunk, 350)
             chunks.append(chunk_txt)
         # Batch embeddings
         embeddings_np = embed_texts(chunks)
@@ -393,8 +406,8 @@ def load_grounding_files(progress_callback=None) -> None:
 
 def main() -> None:
     """Run the Streamlit chat application."""
-    st.set_page_config(page_title="Chatbot with RAG", layout="wide")
-    st.title("Chatbot with Optional Grounding")
+    st.set_page_config(page_title="Ensemble Pedagogy Chatbot", layout="wide")
+    st.title("Ensemble Pedagogy Chatbot")
 
     # Initialise session state containers if this is the first run
     if "messages" not in st.session_state:
@@ -407,6 +420,10 @@ def main() -> None:
         st.session_state["model"] = "o4-mini"
     if "k" not in st.session_state:
         st.session_state["k"] = 4
+    if "summary" not in st.session_state:
+        st.session_state["summary"] = ""
+    if "turn_count_since_summary" not in st.session_state:
+        st.session_state["turn_count_since_summary"] = 0
 
     # Render layout first, then load files (so UI appears immediately)
     sidebar_placeholder = st.sidebar.empty()
@@ -531,10 +548,10 @@ def main() -> None:
                 summary = summarise_document(text_for_summary, model=st.session_state["model"])
             else:
                 summary = ""
-            # Truncate for embedding (safe chunk: 500 tokens per chunk)
+            # Truncate for embedding (tighter chunks: 350 tokens, chunk_size 1600)
             chunks = []
-            for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=2000, overlap=200):
-                chunk_txt = token_truncate(raw_chunk, 500)
+            for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=1600, overlap=200):
+                chunk_txt = token_truncate(raw_chunk, 350)
                 chunks.append(chunk_txt)
             embeddings_np = embed_texts(chunks)
             embeddings_session = []
@@ -723,8 +740,8 @@ def main() -> None:
                     summary = ""
 
                 chunks = []
-                for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=2000, overlap=200):
-                    chunks.append(token_truncate(raw_chunk, 500))
+                for raw_chunk in chunk_text(text_for_embedding_source, chunk_size=1600, overlap=200):
+                    chunks.append(token_truncate(raw_chunk, 350))
                 vectors = embed_texts(chunks)
                 embeddings_session = []
                 embeddings_cache = []
@@ -750,83 +767,148 @@ def main() -> None:
         st.session_state["attach_files"] = []
         st.session_state["attach_note"] = ""
 
-        # Build the context string from file summaries
-        context = build_context_from_summaries(st.session_state["file_data"])
-
-        # Compose the message list for the API call
-        api_messages: List[Dict[str, str]] = [
+        # Compose base system messages (assistant behavior + optional long-term summary)
+        base_msgs: List[Dict[str, str]] = [
             {
                 "role": "system",
                 "content": (
                     "You are a helpful assistant conversing with a user. "
-                    "Use the provided document summaries to ground your answers when relevant."
+                    "Prefer grounded references from provided documents when relevant."
                 ),
             },
         ]
+        if st.session_state.get("summary"):
+            base_msgs.append({
+                "role": "system",
+                "content": "Conversation summary (use for context; avoid repeating verbatim):\n" + st.session_state["summary"],
+            })
+
+        # Build the context string from file summaries
+        context = build_context_from_summaries(st.session_state["file_data"])
         if context:
-            api_messages.append(
+            base_msgs.append(
                 {
                     "role": "system",
                     "content": (
-                        "Here are some documents uploaded by the user. "
-                        "Refer to them if they are relevant to the question:\n\n"
-                        + context
+                        "Here are documents available for grounding. Refer to them if relevant:\n\n" + context
                     ),
                 }
             )
 
-        # If user provided an attachment note, include it as grounding hint
+        # If user provided an attachment note, include it as guidance
         if attach_note:
-            api_messages.append({
+            base_msgs.append({
                 "role": "system",
                 "content": "Attachment note from the user (use as guidance if relevant):\n" + attach_note,
             })
 
-        # Vector search: embed query, find top k similar chunks and append as system message
+        # Vector search: embed query, find top-k similar chunks, deduplicate, and include
         if st.session_state["embeddings"]:
             try:
                 query_embedding = embed_text(user_input)
-                similarities = []
+                sims = []
                 for item in st.session_state["embeddings"]:
                     sim = cosine_similarity(query_embedding, item["embedding"])
-                    similarities.append((sim, item))
-                similarities.sort(key=lambda x: x[0], reverse=True)
-                top_k = similarities[: st.session_state["k"]]
-                retrieved_chunks = [f"File: {item['file']}\nContent: {item['text']}" for _, item in top_k if _ > 0]
+                    sims.append((sim, item))
+                sims.sort(key=lambda x: x[0], reverse=True)
+                top_k = sims[: st.session_state["k"]]
+                seen = set()
+                retrieved_chunks = []
+                for score, item in top_k:
+                    key = (item["file"], item["text"][:120])
+                    if key in seen or score <= 0:
+                        continue
+                    seen.add(key)
+                    retrieved_chunks.append(f"File: {item['file']}\nContent: {item['text']}")
                 if retrieved_chunks:
-                    api_messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "The following text chunks are most relevant to the user's query:\n\n"
-                                + "\n\n---\n\n".join(retrieved_chunks)
-                            ),
-                        }
-                    )
+                    base_msgs.append({
+                        "role": "system",
+                        "content": (
+                            "Top retrieved text chunks (use to answer the question):\n\n" + "\n\n---\n\n".join(retrieved_chunks)
+                        ),
+                    })
             except Exception:
-                # Fail silently on embedding or similarity errors
                 pass
 
-        # Append the conversation history
-        api_messages += st.session_state["messages"]
+        # Strict turn-limited history: only the last RECENT_TURNS are sent with the request.
+        history = recent_history(st.session_state["messages"], RECENT_TURNS)
+        api_messages = base_msgs + history
 
-        # Call the OpenAI API for the assistant's reply
+        # Debug footer: show what is being sent to the API
+        with st.expander("Debug: request context", expanded=False):
+            st.caption(f"Sending last {len(history)} turns. Summary present: {bool(st.session_state.get('summary'))}.")
+
+        # Call the OpenAI API with streaming for faster perceived latency
+        assistant_reply = ""
         try:
-            kwargs = {
+            stream_kwargs = {
                 "model": st.session_state["model"],
                 "messages": api_messages,
             }
             if _supports_temperature(st.session_state["model"]):
-                kwargs["temperature"] = 0.5
-            completion = client.chat.completions.create(**kwargs)
-            assistant_reply = completion.choices[0].message.content.strip()
-        except Exception as exc:  # noqa: BLE001
+                stream_kwargs["temperature"] = 0.5
+
+            with client.chat.completions.stream(**stream_kwargs) as stream:
+                parts: List[str] = []
+                saw_delta = False
+                with st.chat_message("assistant"):
+                    placeholder = st.empty()
+                    for event in stream:
+                        typ = getattr(event, "type", "") or ""
+                        if typ in ("message.delta", "delta", "content.delta"):
+                            delta = getattr(event, "delta", "") or ""
+                            if isinstance(delta, dict):
+                                delta = delta.get("content") or ""
+                            if not isinstance(delta, str):
+                                delta = str(delta)
+                            parts.append(delta)
+                            saw_delta = True
+                            placeholder.markdown("".join(parts))
+                    # If no deltas streamed, still render the final message
+                    try:
+                        final = stream.get_final_response()
+                        final_text = (final.choices[0].message.content or "").strip()
+                        if not saw_delta:
+                            placeholder.markdown(final_text)
+                        # Prefer the built-up parts if we streamed; else use final_text
+                        assistant_reply = ("".join(parts) or final_text).strip()
+                    except Exception:
+                        assistant_reply = ("".join(parts)).strip()
+        except Exception as exc:
             assistant_reply = f"Error contacting OpenAI API: {exc}"
 
-        # Append the assistant's reply to the history and display it
+        # Append the assistant's reply to the history (already rendered during streaming)
         st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
-        with st.chat_message("assistant"):
-            st.markdown(assistant_reply)
+
+        # Rolling summary to keep history compact
+        st.session_state["turn_count_since_summary"] = st.session_state.get("turn_count_since_summary", 0) + 1
+        needs_summary = len(st.session_state["messages"]) > RECENT_TURNS
+        if needs_summary:
+            try:
+                # Summarize everything except the latest RECENT_TURNS turns
+                to_summarize = st.session_state["messages"][:-RECENT_TURNS]
+                if to_summarize:
+                    text_block = "\n".join(f"{m['role']}: {m['content']}" for m in to_summarize)
+                    # Cap summary source aggressively
+                    text_block = token_truncate(text_block, 2500, model=st.session_state["model"])
+                    sum_kwargs = {
+                        "model": "o4-mini",
+                        "messages": [
+                            {"role": "system", "content": "Summarize this dialogue. Keep entities, decisions, tasks, and open questions. Max 200 tokens."},
+                            {"role": "user", "content": text_block},
+                        ],
+                    }
+                    if _supports_temperature("o4-mini"):
+                        sum_kwargs["temperature"] = 0.2
+                    resp = client.chat.completions.create(**sum_kwargs)
+                    new_summary = resp.choices[0].message.content.strip()
+                    prior = st.session_state.get("summary", "")
+                    st.session_state["summary"] = (prior + "\n\n" + new_summary).strip() if prior else new_summary
+                    st.session_state["turn_count_since_summary"] = 0
+                    # Hard-trim: keep only the newest RECENT_TURNS turns
+                    st.session_state["messages"] = st.session_state["messages"][-RECENT_TURNS:]
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
