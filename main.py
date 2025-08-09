@@ -29,6 +29,11 @@ from typing import Dict, List
 import json
 import pprint
 import pathlib
+# --- RAG cache locations (v2) ---
+from pathlib import Path as _PathAlias  # avoid confusion with existing pathlib
+CACHE_DIR = pathlib.Path(__file__).parent / ".cache" / "rag"
+GROUNDING_CACHE = CACHE_DIR / "grounding_cache.v2.json"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 import PyPDF2
 import tiktoken
 import concurrent.futures
@@ -234,7 +239,7 @@ def load_grounding_files(progress_callback=None) -> None:
     if not grounding_path.exists() or not grounding_path.is_dir():
         return
 
-    cache_path = pathlib.Path(__file__).parent / ".grounding_cache.json"
+    cache_path = GROUNDING_CACHE
     cache = {}
     if cache_path.exists():
         try:
@@ -263,10 +268,14 @@ def load_grounding_files(progress_callback=None) -> None:
             # Already loaded in session
             continue
         if cache_key in cache:
-            # Load from cache
-            st.session_state["file_data"][name] = cache[cache_key]["file_data"]
-            for emb in cache[cache_key]["embeddings"]:
-                st.session_state["embeddings"].append(emb)
+            # Load from cache (backward compatible, handle both "embeddings" and "embeddings_cache")
+            st.session_state["file_data"][name] = cache[cache_key].get("file_data", {})
+            emb_list = cache[cache_key].get("embeddings_cache", cache[cache_key].get("embeddings", []))
+            for emb in emb_list:
+                emb_session = dict(emb)
+                if isinstance(emb_session.get("embedding"), list):
+                    emb_session["embedding"] = np.array(emb_session["embedding"], dtype=np.float32)
+                st.session_state["embeddings"].append(emb_session)
             if progress_callback:
                 progress_callback(f"Loaded {name} from cache")
             continue
@@ -372,8 +381,9 @@ def load_grounding_files(progress_callback=None) -> None:
                 except Exception as exc:
                     if progress_callback:
                         progress_callback(f"Failed loading {name}: {exc}")
-    # Save cache
+    # Save cache (ensure directory exists)
     try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache, f)
     except Exception:
@@ -820,21 +830,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Patch: After loading from cache, convert embeddings back to numpy arrays for session usage
-    grounding_path = pathlib.Path(__file__).parent / "grounding"
-    cache_path = pathlib.Path(__file__).parent / ".grounding_cache.json"
-    if cache_path.exists():
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            # For all cache keys, update session embeddings if not already present
-            if "embeddings" in st.session_state and isinstance(st.session_state["embeddings"], list):
-                for cache_key, cache_val in cache.items():
-                    if "embeddings_cache" in cache_val:
-                        for emb in cache_val["embeddings_cache"]:
-                            emb = dict(emb)
-                            emb["embedding"] = np.array(emb["embedding"], dtype=np.float32)
-                            st.session_state["embeddings"].append(emb)
-        except Exception:
-            pass
     main()
